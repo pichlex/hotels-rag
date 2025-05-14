@@ -1,40 +1,102 @@
-import altair as alt
-import numpy as np
-import pandas as pd
 import streamlit as st
+import os
+import lancedb
+from langchain.chains import create_retrieval_chain, create_history_aware_retriever
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_community.chat_message_histories import ChatMessageHistory
+from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_community.vectorstores import LanceDB
+import uuid
+from dotenv import load_dotenv
 
-"""
-# Welcome to Streamlit!
+load_dotenv()
+if "OPENAI_API_KEY" not in os.environ:
+    raise ValueError("Please set OPENAI_API_KEY in .env file")
 
-Edit `/streamlit_app.py` to customize this app to your heart's desire :heart:.
-If you have any questions, checkout our [documentation](https://docs.streamlit.io) and [community
-forums](https://discuss.streamlit.io).
+def initialize_components():
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    
+    db = lancedb.connect("../lancedb/hotels_rag_db")
+    
+    vectorstore = LanceDB(
+        connection=db,
+        embedding=embeddings,
+        table_name="embeddings"
+    )
+    
+    return vectorstore.as_retriever(), ChatOpenAI(model="gpt-4.1")
 
-In the meantime, below is an example of what you can do with just a few lines of code:
-"""
+def create_rag_chain(retriever, llm):
+    history_aware_prompt = ChatPromptTemplate.from_messages([
+        ("system", "Ты - специалист по бронированию отелей в турагентстве. Будь вежлив, работай хорошо, и тебе дадут годовую премию. Используй историю чата, чтобы улучшить ответы."),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+        ("system", "Ищи подходящие отели:"),
+    ])
 
-num_points = st.slider("Number of points in spiral", 1, 10000, 1100)
-num_turns = st.slider("Number of turns in spiral", 1, 300, 31)
+    qa_prompt = ChatPromptTemplate.from_messages([
+        ("system", """Ответь, используя данный контекст:
+        {context}
+        ---
+        История чата: {chat_history}"""),
+        ("human", "{input}"),
+    ])
 
-indices = np.linspace(0, 1, num_points)
-theta = 2 * np.pi * num_turns * indices
-radius = indices
+    history_aware_retriever = create_history_aware_retriever(
+        llm, retriever, history_aware_prompt
+    )
+    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    
+    return create_retrieval_chain(history_aware_retriever, question_answer_chain)
 
-x = radius * np.cos(theta)
-y = radius * np.sin(theta)
 
-df = pd.DataFrame({
-    "x": x,
-    "y": y,
-    "idx": indices,
-    "rand": np.random.randn(num_points),
-})
+#--------Streamlit UI------------
 
-st.altair_chart(alt.Chart(df, height=700, width=700)
-    .mark_point(filled=True)
-    .encode(
-        x=alt.X("x", axis=None),
-        y=alt.Y("y", axis=None),
-        color=alt.Color("idx", legend=None, scale=alt.Scale()),
-        size=alt.Size("rand", legend=None, scale=alt.Scale(range=[1, 150])),
-    ))
+st.title("🏨 Ассистент")
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+retriever, llm = initialize_components()
+rag_chain = create_rag_chain(retriever, llm)
+
+store = {}
+
+def get_session_history(session_id: str) -> BaseChatMessageHistory:
+    if session_id not in store:
+        store[session_id] = ChatMessageHistory()
+    return store[session_id]
+
+conversational_rag_chain = RunnableWithMessageHistory(
+    rag_chain,
+    get_session_history,
+    input_messages_key="input",
+    history_messages_key="chat_history",
+    output_messages_key="answer",
+)
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input("Спросите что-нибудь..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        response = conversational_rag_chain.invoke(
+            {"input": prompt},
+            config={"configurable": {"session_id": st.session_state.session_id}}
+        )
+        answer = response["answer"]
+        
+        st.markdown(answer)
+    
+    st.session_state.messages.append({"role": "assistant", "content": answer})
