@@ -19,7 +19,7 @@ if "OPENAI_API_KEY" not in os.environ:
 def initialize_components():
     embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
     
-    db = lancedb.connect("../lancedb/hotels_rag_db")
+    db = lancedb.connect("lancedb/hotels_rag_db")
     
     vectorstore = LanceDB(
         connection=db,
